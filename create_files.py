@@ -1,0 +1,445 @@
+files = {
+    'requirements.txt': """opencv-python
+face-recognition
+numpy
+Pillow
+pandas""",
+
+    'database.py': """import sqlite3
+import datetime
+import pandas as pd
+
+class AttendanceDatabase:
+    def __init__(self, db_path="attendance_records.db"):
+        self.db_path = db_path
+        self.init_database()
+    
+    def init_database(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS students (
+                student_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                department TEXT,
+                year TEXT,
+                face_encoding_path TEXT,
+                registered_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS attendance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_id TEXT,
+                name TEXT,
+                date DATE,
+                time TIME,
+                status TEXT DEFAULT 'Present'
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def register_student(self, student_id, name, department, year, face_encoding_path):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO students (student_id, name, department, year, face_encoding_path)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (student_id, name, department, year, face_encoding_path))
+            conn.commit()
+            conn.close()
+            return True
+        except:
+            return False
+    
+    def mark_attendance(self, student_id, name):
+        today = datetime.datetime.now().date()
+        current_time = datetime.datetime.now().time()
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT * FROM attendance 
+            WHERE student_id = ? AND date = ?
+        ''', (student_id, today))
+        
+        if cursor.fetchone() is None:
+            cursor.execute('''
+                INSERT INTO attendance (student_id, name, date, time)
+                VALUES (?, ?, ?, ?)
+            ''', (student_id, name, today, current_time))
+            conn.commit()
+            conn.close()
+            return True
+        else:
+            conn.close()
+            return False
+    
+    def get_attendance_by_date(self, date):
+        conn = sqlite3.connect(self.db_path)
+        query = "SELECT * FROM attendance WHERE date = ?"
+        df = pd.read_sql_query(query, conn, params=(date,))
+        conn.close()
+        return df
+    
+    def get_all_students(self):
+        conn = sqlite3.connect(self.db_path)
+        query = "SELECT * FROM students"
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df
+    
+    def export_attendance_to_csv(self, filename):
+        conn = sqlite3.connect(self.db_path)
+        df = pd.read_sql_query("SELECT * FROM attendance ORDER BY date DESC, time DESC", conn)
+        df.to_csv(f"attendance_logs/{filename}.csv", index=False)
+        conn.close()
+        return f"attendance_logs/{filename}.csv"
+""",
+
+    'face_encoder.py': """import cv2
+import face_recognition
+import numpy as np
+import pickle
+import os
+
+class FaceEncoder:
+    def __init__(self, known_faces_path="known_faces/"):
+        self.known_faces_path = known_faces_path
+        if not os.path.exists(known_faces_path):
+            os.makedirs(known_faces_path)
+        
+        self.known_face_encodings = []
+        self.known_face_names = []
+        self.known_face_ids = []
+        self.load_known_faces()
+    
+    def encode_face(self, image_path, student_id, name):
+        try:
+            image = face_recognition.load_image_file(image_path)
+            face_encodings = face_recognition.face_encodings(image)
+            
+            if len(face_encodings) > 0:
+                face_encoding = face_encodings[0]
+                encoding_path = os.path.join(self.known_faces_path, f"{student_id}_{name}.pkl")
+                
+                with open(encoding_path, 'wb') as f:
+                    pickle.dump({
+                        'student_id': student_id,
+                        'name': name,
+                        'encoding': face_encoding
+                    }, f)
+                
+                self.known_face_encodings.append(face_encoding)
+                self.known_face_names.append(name)
+                self.known_face_ids.append(student_id)
+                
+                return encoding_path
+            else:
+                return None
+        except Exception as e:
+            print(f"Error encoding face: {e}")
+            return None
+    
+    def load_known_faces(self):
+        for filename in os.listdir(self.known_faces_path):
+            if filename.endswith('.pkl'):
+                filepath = os.path.join(self.known_faces_path, filename)
+                with open(filepath, 'rb') as f:
+                    data = pickle.load(f)
+                    self.known_face_encodings.append(data['encoding'])
+                    self.known_face_names.append(data['name'])
+                    self.known_face_ids.append(data['student_id'])
+    
+    def recognize_face(self, frame):
+        small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
+        rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+        
+        face_locations = face_recognition.face_locations(rgb_small_frame)
+        face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
+        
+        recognized_faces = []
+        
+        for face_encoding, face_location in zip(face_encodings, face_locations):
+            top, right, bottom, left = [coord * 4 for coord in face_location]
+            
+            if len(self.known_face_encodings) > 0:
+                matches = face_recognition.compare_faces(self.known_face_encodings, face_encoding)
+                face_distances = face_recognition.face_distance(self.known_face_encodings, face_encoding)
+                
+                best_match_index = np.argmin(face_distances)
+                
+                if matches[best_match_index]:
+                    name = self.known_face_names[best_match_index]
+                    student_id = self.known_face_ids[best_match_index]
+                    
+                    recognized_faces.append({
+                        'name': name,
+                        'student_id': student_id,
+                        'location': (top, right, bottom, left)
+                    })
+        
+        return recognized_faces
+""",
+
+    'attendance_system.py': """import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import cv2
+from PIL import Image, ImageTk
+import datetime
+import os
+from database import AttendanceDatabase
+from face_encoder import FaceEncoder
+
+class FaceRecognitionAttendanceSystem:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Face Recognition Attendance System")
+        self.root.geometry("1200x700")
+        
+        self.db = AttendanceDatabase()
+        self.face_encoder = FaceEncoder()
+        self.camera = None
+        self.is_camera_running = False
+        self.current_frame = None
+        
+        self.setup_ui()
+        
+        # Create attendance_logs folder
+        if not os.path.exists("attendance_logs"):
+            os.makedirs("attendance_logs")
+    
+    def setup_ui(self):
+        # Main container
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Title
+        title_label = ttk.Label(main_frame, text="Face Recognition Attendance System", 
+                               font=('Arial', 20, 'bold'))
+        title_label.grid(row=0, column=0, columnspan=3, pady=10)
+        
+        # Left Panel - Camera Feed
+        camera_frame = ttk.LabelFrame(main_frame, text="Camera Feed", padding="10")
+        camera_frame.grid(row=1, column=0, padx=10, pady=10)
+        
+        self.camera_label = ttk.Label(camera_frame)
+        self.camera_label.grid(row=0, column=0)
+        
+        # Camera controls
+        camera_controls = ttk.Frame(camera_frame)
+        camera_controls.grid(row=1, column=0, pady=10)
+        
+        self.start_camera_btn = ttk.Button(camera_controls, text="Start Camera", 
+                                          command=self.start_camera)
+        self.start_camera_btn.grid(row=0, column=0, padx=5)
+        
+        self.stop_camera_btn = ttk.Button(camera_controls, text="Stop Camera", 
+                                         command=self.stop_camera, state='disabled')
+        self.stop_camera_btn.grid(row=0, column=1, padx=5)
+        
+        self.mark_btn = ttk.Button(camera_controls, text="Mark Attendance", 
+                                  command=self.mark_attendance)
+        self.mark_btn.grid(row=0, column=2, padx=5)
+        
+        # Middle Panel - Registration
+        register_frame = ttk.LabelFrame(main_frame, text="Register New Student", padding="10")
+        register_frame.grid(row=1, column=1, padx=10, pady=10)
+        
+        ttk.Label(register_frame, text="Student ID:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.student_id_entry = ttk.Entry(register_frame, width=20)
+        self.student_id_entry.grid(row=0, column=1, pady=5)
+        
+        ttk.Label(register_frame, text="Full Name:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.student_name_entry = ttk.Entry(register_frame, width=20)
+        self.student_name_entry.grid(row=1, column=1, pady=5)
+        
+        ttk.Label(register_frame, text="Department:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.department_combo = ttk.Combobox(register_frame, 
+                                           values=["CS", "Engineering", "Business", "Arts"], 
+                                           width=17)
+        self.department_combo.grid(row=2, column=1, pady=5)
+        self.department_combo.set("CS")
+        
+        ttk.Label(register_frame, text="Year:").grid(row=3, column=0, sticky=tk.W, pady=5)
+        self.year_combo = ttk.Combobox(register_frame, 
+                                      values=["1st", "2nd", "3rd", "4th"], 
+                                      width=17)
+        self.year_combo.grid(row=3, column=1, pady=5)
+        self.year_combo.set("1st")
+        
+        ttk.Label(register_frame, text="Photo:").grid(row=4, column=0, sticky=tk.W, pady=5)
+        self.photo_label = ttk.Label(register_frame, text="No file selected")
+        self.photo_label.grid(row=4, column=1, pady=5)
+        
+        ttk.Button(register_frame, text="Browse Photo", 
+                  command=self.browse_photo).grid(row=5, column=0, columnspan=2, pady=5)
+        
+        ttk.Button(register_frame, text="Register Student", 
+                  command=self.register_student).grid(row=6, column=0, columnspan=2, pady=10)
+        
+        # Right Panel - Attendance View
+        view_frame = ttk.LabelFrame(main_frame, text="Today's Attendance", padding="10")
+        view_frame.grid(row=1, column=2, padx=10, pady=10)
+        
+        # Treeview
+        self.tree = ttk.Treeview(view_frame, columns=("ID", "Name", "Time"), 
+                                show="headings", height=15)
+        self.tree.heading("ID", text="Student ID")
+        self.tree.heading("Name", text="Name")
+        self.tree.heading("Time", text="Time")
+        self.tree.pack()
+        
+        # Export button
+        ttk.Button(view_frame, text="Export to CSV", 
+                  command=self.export_attendance).pack(pady=10)
+        
+        # Status bar
+        self.status_label = ttk.Label(self.root, text="Ready", relief=tk.SUNKEN)
+        self.status_label.grid(row=2, column=0, sticky=(tk.W, tk.E))
+        
+        self.refresh_attendance()
+    
+    def start_camera(self):
+        self.camera = cv2.VideoCapture(0)
+        if self.camera.isOpened():
+            self.is_camera_running = True
+            self.start_camera_btn.config(state='disabled')
+            self.stop_camera_btn.config(state='normal')
+            self.update_camera()
+            self.status_label.config(text="Camera started")
+    
+    def stop_camera(self):
+        self.is_camera_running = False
+        if self.camera:
+            self.camera.release()
+        self.camera_label.config(image='')
+        self.start_camera_btn.config(state='normal')
+        self.stop_camera_btn.config(state='disabled')
+        self.status_label.config(text="Camera stopped")
+    
+    def update_camera(self):
+        if self.is_camera_running:
+            ret, frame = self.camera.read()
+            if ret:
+                self.current_frame = frame
+                
+                # Recognize faces
+                faces = self.face_encoder.recognize_face(frame)
+                
+                # Draw rectangles
+                for face in faces:
+                    top, right, bottom, left = face['location']
+                    cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+                    cv2.putText(frame, face['name'], (left, top-10), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                
+                # Convert to ImageTk
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(rgb)
+                img = img.resize((480, 360))
+                imgtk = ImageTk.PhotoImage(img)
+                
+                self.camera_label.config(image=imgtk)
+                self.camera_label.image = imgtk
+            
+            self.root.after(10, self.update_camera)
+    
+    def browse_photo(self):
+        filename = filedialog.askopenfilename(
+            title="Select Photo",
+            filetypes=[("Image files", "*.jpg *.jpeg *.png")]
+        )
+        if filename:
+            self.photo_path = filename
+            self.photo_label.config(text=os.path.basename(filename))
+    
+    def register_student(self):
+        student_id = self.student_id_entry.get()
+        name = self.student_name_entry.get()
+        dept = self.department_combo.get()
+        year = self.year_combo.get()
+        
+        if not all([student_id, name]):
+            messagebox.showwarning("Warning", "Please fill all fields")
+            return
+        
+        if not hasattr(self, 'photo_path'):
+            messagebox.showwarning("Warning", "Please select a photo")
+            return
+        
+        encoding_path = self.face_encoder.encode_face(self.photo_path, student_id, name)
+        
+        if encoding_path:
+            if self.db.register_student(student_id, name, dept, year, encoding_path):
+                messagebox.showinfo("Success", f"Student {name} registered!")
+                self.student_id_entry.delete(0, tk.END)
+                self.student_name_entry.delete(0, tk.END)
+                self.photo_label.config(text="No file selected")
+            else:
+                messagebox.showerror("Error", "Student ID already exists!")
+        else:
+            messagebox.showerror("Error", "No face detected in photo")
+    
+    def mark_attendance(self):
+        if self.current_frame is None:
+            messagebox.showwarning("Warning", "No camera frame available")
+            return
+        
+        faces = self.face_encoder.recognize_face(self.current_frame)
+        
+        if faces:
+            for face in faces:
+                if self.db.mark_attendance(face['student_id'], face['name']):
+                    self.status_label.config(text=f"Marked: {face['name']}")
+                else:
+                    self.status_label.config(text=f"{face['name']} already marked")
+            self.refresh_attendance()
+        else:
+            messagebox.showinfo("Info", "No recognized faces found")
+    
+    def refresh_attendance(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        today = datetime.datetime.now().date()
+        df = self.db.get_attendance_by_date(today)
+        
+        for _, row in df.iterrows():
+            self.tree.insert('', 'end', values=(row['student_id'], row['name'], row['time']))
+    
+    def export_attendance(self):
+        filename = f"attendance_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        filepath = self.db.export_attendance_to_csv(filename)
+        messagebox.showinfo("Success", f"Exported to {filepath}")
+
+def main():
+    root = tk.Tk()
+    app = FaceRecognitionAttendanceSystem(root)
+    root.mainloop()
+""",
+
+    'run_system.py': """from attendance_system import main
+
+if __name__ == "__main__":
+    print("Starting Face Recognition Attendance System...")
+    main()
+"""
+}
+
+# Create all files
+for filename, content in files.items():
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write(content)
+    print(f"Created {filename}")
+
+print("\n✅ All files created successfully!")
+print("\nNow run these commands:")
+print("1. pip install -r requirements.txt")
+print("2. python run_system.py")
